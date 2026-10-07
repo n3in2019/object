@@ -4,12 +4,15 @@
 #include "object/type_info.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <typeindex>
 #include <unordered_map>
@@ -185,17 +188,51 @@ class ObjectFactory {
   // keying off the instance's __type_index().
   static std::shared_ptr<ObjectBase> get_single_instance(std::string_view name) {
     auto &self = instance();
+    const std::string key(name);
+    std::shared_ptr<SingletonInitialization> initialization;
     {
-      std::lock_guard<std::mutex> lock(self.mutex_);
-      const auto it = self.singletons_.find(std::string(name));
+      std::unique_lock<std::mutex> lock(self.mutex_);
+      const auto it = self.singletons_.find(key);
       if (it != self.singletons_.end()) {
         return it->second;
       }
+      const auto pending = self.singleton_initializations_.find(key);
+      if (pending != self.singleton_initializations_.end()) {
+        initialization = pending->second;
+        if (initialization->owner == std::this_thread::get_id()) {
+          throw std::logic_error("recursive singleton initialization: " + key);
+        }
+        initialization->ready.wait(lock, [&] {
+          return initialization->done || self.singletons_.find(key) != self.singletons_.end();
+        });
+        const auto cached = self.singletons_.find(key);
+        if (cached != self.singletons_.end()) {
+          return cached->second;
+        }
+        std::rethrow_exception(initialization->error);
+      }
+      initialization = std::make_shared<SingletonInitialization>();
+      self.singleton_initializations_.emplace(key, initialization);
     }
-    auto singleton = create_shared(name);
-    std::lock_guard<std::mutex> lock(self.mutex_);
-    const auto it = self.singletons_.emplace(std::string(name), std::move(singleton)).first;
-    return it->second;
+    // No registry lock (or per-name lock) is held while invoking user code.
+    // Keep the constructed object alive until after unlocking, even if a setter wins.
+    std::shared_ptr<ObjectBase> singleton;
+    try {
+      singleton = create_shared(key);
+      std::lock_guard<std::mutex> lock(self.mutex_);
+      const auto cached = self.singletons_.emplace(key, singleton).first;
+      initialization->done = true;
+      self.singleton_initializations_.erase(key);
+      initialization->ready.notify_all();
+      return cached->second;
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(self.mutex_);
+      initialization->error = std::current_exception();
+      initialization->done = true;
+      self.singleton_initializations_.erase(key);
+      initialization->ready.notify_all();
+      throw;
+    }
   }
 
   // Typed variant; works under -fno-rtti (identity via __type_index, no dynamic_cast).
@@ -222,6 +259,10 @@ class ObjectFactory {
     for (const auto &entry : self.types_) {
       if (entry.second.type_index == index) {
         self.singletons_[entry.first] = std::move(singleton);
+        const auto pending = self.singleton_initializations_.find(entry.first);
+        if (pending != self.singleton_initializations_.end()) {
+          pending->second->ready.notify_all();
+        }
         return;
       }
     }
@@ -229,6 +270,15 @@ class ObjectFactory {
   }
 
  private:
+  // Fields are protected by mutex_; shared ownership keeps the condition variable
+  // alive for waiters after the completed attempt is removed from the map.
+  struct SingletonInitialization {
+    std::condition_variable ready;
+    std::thread::id owner = std::this_thread::get_id();
+    bool done = false;
+    std::exception_ptr error;
+  };
+
   ObjectFactory() = default;
   ~ObjectFactory() = default;
 
@@ -264,6 +314,7 @@ class ObjectFactory {
   std::mutex mutex_;
   std::unordered_map<std::string, TypeInfo> types_;
   std::unordered_map<std::string, std::shared_ptr<ObjectBase>> singletons_;
+  std::unordered_map<std::string, std::shared_ptr<SingletonInitialization>> singleton_initializations_;
 };
 
 }  // namespace obj

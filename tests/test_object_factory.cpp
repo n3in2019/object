@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -40,6 +44,83 @@ class Square : public obj::Object<Square, tag::Shape> {
 class Blob : public obj::Object<Blob> {};
 
 class Ellipse : public Circle {};
+
+// Test-controlled construction window; timeouts only bound failed tests.
+struct ConstructionGate {
+  std::mutex mutex;
+  std::condition_variable changed;
+  int entered = 0;
+  bool released = false;
+
+  void enter() {
+    std::unique_lock<std::mutex> lock(mutex);
+    ++entered;
+    changed.notify_all();
+    if (!changed.wait_for(lock, std::chrono::seconds(5), [&] { return released; })) {
+      throw std::runtime_error("construction gate timed out");
+    }
+  }
+
+  bool wait_for_entries(int count, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return changed.wait_for(lock, timeout, [&] { return entered >= count; });
+  }
+
+  void release() {
+    std::lock_guard<std::mutex> lock(mutex);
+    released = true;
+    changed.notify_all();
+  }
+};
+
+class ColdSingleton : public obj::Object<ColdSingleton> {
+ public:
+  static inline std::atomic<int> constructions{0};
+  static inline ConstructionGate *gate = nullptr;
+  ColdSingleton() {
+    ++constructions;
+    // Registry access, ordinary construction and a different singleton must all
+    // be safe inside the user constructor.
+    (void)obj::ObjectFactory::list_types();
+    (void)obj::ObjectFactory::create_shared(nested::Square::_type());
+    (void)obj::ObjectFactory::get_single_instance<Blob>();
+    gate->enter();
+  }
+};
+
+class OverriddenSingleton : public obj::Object<OverriddenSingleton> {
+ public:
+  static inline ConstructionGate *gate = nullptr;
+  OverriddenSingleton() { gate->enter(); }
+  explicit OverriddenSingleton(int) {}  // replacement bypasses the blocked factory
+};
+
+class RetriedSingleton : public obj::Object<RetriedSingleton> {
+ public:
+  static inline std::atomic<int> attempts{0};
+  RetriedSingleton() {
+    if (++attempts == 1) throw std::runtime_error("first attempt fails");
+  }
+};
+
+class RecursiveSingleton : public obj::Object<RecursiveSingleton> {
+ public:
+  RecursiveSingleton() { (void)obj::ObjectFactory::get_single_instance<RecursiveSingleton>(); }
+};
+
+class FailedColdSingleton : public obj::Object<FailedColdSingleton> {
+ public:
+  static inline ConstructionGate *gate = nullptr;
+  static inline std::atomic<int> attempts{0};
+  static inline bool fail = true;
+  FailedColdSingleton() {
+    ++attempts;
+    if (fail) {
+      gate->enter();
+      throw std::runtime_error("controlled construction failure");
+    }
+  }
+};
 
 static_assert(obj::is_tagged_v<Circle, tag::Shape>);
 static_assert(obj::is_tagged_v<Circle, tag::TwoD>);
@@ -191,6 +272,122 @@ TEST(Singleton, SettableAndTypeChecked) {
   EXPECT_THROW(obj::ObjectFactory::set_single_instance(std::make_shared<Ghost>()), std::out_of_range);
 
   obj::ObjectFactory::set_single_instance(std::make_shared<tf::Circle>());  // restore for other tests
+}
+
+TEST(Singleton, ConcurrentColdStartConstructsExactlyOnce) {
+  constexpr int callers = 16;
+  tf::ConstructionGate construction;
+  tf::ColdSingleton::gate = &construction;
+  std::mutex start_mutex;
+  std::condition_variable start_changed;
+  int ready = 0;
+  bool start = false;
+  std::atomic<int> failures{0};
+  std::vector<std::shared_ptr<tf::ColdSingleton>> results(callers);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < callers; ++i) {
+    threads.emplace_back([&, i] {
+      {
+        std::unique_lock<std::mutex> lock(start_mutex);
+        ++ready;
+        start_changed.notify_all();
+        start_changed.wait(lock, [&] { return start; });
+      }
+      try {
+        results[i] = obj::ObjectFactory::get_single_instance<tf::ColdSingleton>();
+      } catch (...) {
+        ++failures;
+      }
+    });
+  }
+  {
+    std::unique_lock<std::mutex> lock(start_mutex);
+    start_changed.wait(lock, [&] { return ready == callers; });
+    start = true;
+    start_changed.notify_all();
+  }
+  EXPECT_TRUE(construction.wait_for_entries(1, std::chrono::seconds(5)));
+  // Keep the first constructor blocked while the simultaneous callers compete.
+  // A second entry is positive evidence of the old bug, not a sleep-based order.
+  EXPECT_FALSE(construction.wait_for_entries(2, std::chrono::milliseconds(100)));
+  construction.release();
+  for (auto &thread : threads) thread.join();
+  tf::ColdSingleton::gate = nullptr;
+  EXPECT_EQ(failures.load(), 0);
+  EXPECT_EQ(tf::ColdSingleton::constructions.load(), 1);
+  ASSERT_NE(results[0], nullptr);
+  for (const auto &result : results) EXPECT_EQ(result.get(), results[0].get());
+}
+
+TEST(Singleton, SetterWinsDuringColdStart) {
+  tf::ConstructionGate construction;
+  tf::OverriddenSingleton::gate = &construction;
+  std::shared_ptr<tf::OverriddenSingleton> result;
+  std::atomic<int> failures{0};
+  std::thread creator([&] {
+    try {
+      result = obj::ObjectFactory::get_single_instance<tf::OverriddenSingleton>();
+    } catch (...) {
+      ++failures;
+    }
+  });
+  EXPECT_TRUE(construction.wait_for_entries(1, std::chrono::seconds(5)));
+  auto waiting = std::async(std::launch::async, [] {
+    return obj::ObjectFactory::get_single_instance<tf::OverriddenSingleton>();
+  });
+  EXPECT_EQ(waiting.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+  auto replacement = std::make_shared<tf::OverriddenSingleton>(0);
+  obj::ObjectFactory::set_single_instance(replacement);
+  // An already waiting reader must wake even while the constructor stays blocked.
+  const auto waiter_status = waiting.wait_for(std::chrono::seconds(2));
+  // The setter and readers need not wait for the old construction to complete.
+  EXPECT_EQ(obj::ObjectFactory::get_single_instance<tf::OverriddenSingleton>().get(), replacement.get());
+  construction.release();
+  creator.join();
+  EXPECT_EQ(waiter_status, std::future_status::ready);
+  EXPECT_EQ(waiting.get().get(), replacement.get());
+  tf::OverriddenSingleton::gate = nullptr;
+  EXPECT_EQ(failures.load(), 0);
+  EXPECT_EQ(result.get(), replacement.get());
+  EXPECT_EQ(obj::ObjectFactory::get_single_instance<tf::OverriddenSingleton>().get(), replacement.get());
+}
+
+TEST(Singleton, FailedConstructionCanBeRetried) {
+  EXPECT_THROW(obj::ObjectFactory::get_single_instance<tf::RetriedSingleton>(), std::runtime_error);
+  auto result = obj::ObjectFactory::get_single_instance<tf::RetriedSingleton>();
+  EXPECT_EQ(tf::RetriedSingleton::attempts.load(), 2);
+  EXPECT_EQ(obj::ObjectFactory::get_single_instance<tf::RetriedSingleton>().get(), result.get());
+}
+
+TEST(Singleton, FailedColdStartWakesWaitersAndAllowsRetry) {
+  tf::ConstructionGate construction;
+  tf::FailedColdSingleton::gate = &construction;
+  auto request = [] {
+    try {
+      (void)obj::ObjectFactory::get_single_instance<tf::FailedColdSingleton>();
+      return false;
+    } catch (const std::runtime_error &error) {
+      return std::string(error.what()) == "controlled construction failure";
+    }
+  };
+  auto creator = std::async(std::launch::async, request);
+  EXPECT_TRUE(construction.wait_for_entries(1, std::chrono::seconds(5)));
+  auto waiting = std::async(std::launch::async, request);
+  EXPECT_EQ(waiting.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+  construction.release();
+  EXPECT_TRUE(creator.get());
+  EXPECT_TRUE(waiting.get());
+  EXPECT_EQ(tf::FailedColdSingleton::attempts.load(), 1);
+  tf::FailedColdSingleton::fail = false;
+  auto result = obj::ObjectFactory::get_single_instance<tf::FailedColdSingleton>();
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(tf::FailedColdSingleton::attempts.load(), 2);
+  tf::FailedColdSingleton::gate = nullptr;
+}
+
+TEST(Singleton, RecursiveInitializationThrowsWithoutStrandingState) {
+  EXPECT_THROW(obj::ObjectFactory::get_single_instance<tf::RecursiveSingleton>(), std::logic_error);
+  EXPECT_THROW(obj::ObjectFactory::get_single_instance<tf::RecursiveSingleton>(), std::logic_error);
 }
 
 TEST(Factory, ConcurrentAccessIsSafe) {

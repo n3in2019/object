@@ -87,6 +87,17 @@ caches per name; `get_single_instance<T>()` is the typed form and works under
 `set_single_instance(instance)` replaces or pre-seeds the cached singleton, keyed off
 the instance's `__type_index()`.
 
+Concurrent first access to the same name runs only one factory attempt; other
+callers wait without holding the registry mutex. Constructors may call registry
+APIs, create ordinary objects, or request other singletons. Recursive singleton
+dependencies must be acyclic: requesting a singleton already being constructed on
+the same thread throws `std::logic_error`; cycles across threads are unsupported.
+If construction throws, waiting callers receive the failure unless a cached value
+is available, and a later call may retry. `set_single_instance()` never waits for
+an in-flight constructor: it publishes its replacement immediately, wakes waiting
+readers, and the older successful factory attempt cannot overwrite it. A factory
+attempt that throws still propagates its exception to its initiating caller.
+
 ## Notes
 
 - `Object<T>` requires a default-constructible `T` (`static_assert` otherwise). Only
